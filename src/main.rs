@@ -3,7 +3,7 @@ mod reclaim;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use dirs::config_dir;
-use rumqttc::{Client, Event, MqttOptions, Packet, QoS, Transport, TlsConfiguration};
+use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport, TlsConfiguration};
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -61,12 +61,12 @@ fn ensure_ca_pem(path: &Path) -> Result<PathBuf> {
     }
     fs::create_dir_all(path).context("creating config dir for CA")?;
     let url = "https://www.amazontrust.com/repository/AmazonRootCA1.pem";
-    let pem = reqwest::blocking::get(url)
-        .context("downloading Amazon Root CA 1")?
-        .error_for_status()
-        .context("HTTP error downloading CA")?
-        .text()
-        .context("reading CA body")?;
+    let response = ureq::get(url)
+        .call()
+        .map_err(|e| anyhow!("downloading Amazon Root CA 1: {}", e))?;
+    let pem = response
+        .into_string()
+        .map_err(|e| anyhow!("reading CA body: {}", e))?;
     let mut f = fs::File::create(&ca_path).context("creating CA pem file")?;
     f.write_all(pem.as_bytes()).context("writing CA pem")?;
     Ok(ca_path)
@@ -167,7 +167,7 @@ fn build_mqtt_options(endpoint: &str, client_id: &str, cfg_dir: &Path) -> Result
     Ok(options)
 }
 
-fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
+async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     let cfg = config_home(cli)?;
     let _ = ensure_ca_pem(&cfg)?;
 
@@ -177,14 +177,13 @@ fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     // Use hexid as client-id to keep it simple
     let mqttoptions = build_mqtt_options(&cli.endpoint, &format!("reclaim-{}", hexid), &cfg)?;
 
-    let (client, eventloop) = Client::new(mqttoptions, 10);
+    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
 
-    client.subscribe(topic.clone(), QoS::AtMostOnce)?;
+    client.subscribe(topic.clone(), QoS::AtMostOnce).await?;
     println!("Subscribed to {} on {}", topic, cli.endpoint);
 
-    let mut connection = eventloop;
-    for notification in connection.iter() {
-        match notification {
+    loop {
+        match eventloop.poll().await {
             Ok(Event::Incoming(Packet::Publish(p))) => {
                 let payload = String::from_utf8_lossy(&p.payload);
                 println!("{}", payload);
@@ -195,8 +194,6 @@ fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
             }
         }
     }
-    #[allow(unreachable_code)]
-    Ok(())
 }
 
 #[tokio::main]
@@ -204,6 +201,6 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match &cli.command {
         Commands::FetchCerts => fetch_and_save_certs(&cli).await,
-        Commands::Subscribe { unique_id } => subscribe(&cli, unique_id),
+        Commands::Subscribe { unique_id } => subscribe(&cli, unique_id).await, 
     }
 }

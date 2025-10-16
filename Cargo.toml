@@ -12,5 +12,5 @@ aws-sdk-cognitoidentity = "1"
 aws-sdk-iot = "1"
 rumqttc = { version = "0.24", default-features = false, features = ["use-rustls", "url"] }
 dirs = "5"
-reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+ureq = { version = "2", default-features = true }
 anyhow = "1"
