@@ -153,13 +153,17 @@ fn build_mqtt_options(endpoint: &str, client_id: &str, cfg_dir: &Path) -> Result
     let mut options = MqttOptions::new(client_id, endpoint, 8883);
     options.set_keep_alive(Duration::from_secs(30));
 
-    let ca = fs::read(cfg_dir.join("AmazonRootCA1.pem")).context("reading CA pem")?;
-    let cert = fs::read(cfg_dir.join("certificate.pem")).context("reading certificate.pem")?;
-    let key = fs::read(cfg_dir.join("private.pem")).context("reading private.pem")?;
+    let ca_path = cfg_dir.join("AmazonRootCA1.pem");
+    let cert_path = cfg_dir.join("certificate.pem");
+    let key_path = cfg_dir.join("private.pem");
+
+    let ca = fs::read(&ca_path).with_context(|| format!("reading CA pem at {}", ca_path.display()))?;
+    let cert = fs::read(&cert_path).with_context(|| format!("reading certificate.pem at {}", cert_path.display()))?;
+    let key = fs::read(&key_path).with_context(|| format!("reading private.pem at {}", key_path.display()))?;
 
     let tls_config = TlsConfiguration::Simple {
         ca,
-        alpn: Some(vec![b"x-amzn-mqtt-ca".to_vec()]),
+        alpn: None,
         client_auth: Some((cert, key)),
     };
     options.set_transport(Transport::Tls(tls_config));
