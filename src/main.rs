@@ -6,6 +6,7 @@ use dirs::config_dir;
 use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport, TlsConfiguration};
 use std::fs;
 use std::io::Write;
+use std::ops::Shr;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 use aws_config::BehaviorVersion;
@@ -146,7 +147,8 @@ fn hex_id_from_decimal(decimal: &str) -> Result<String> {
         return Err(anyhow!("Invalid unique_id: must be 17 digits with valid checksum"));
     }
     let id_num: u64 = decimal.parse().context("parsing unique_id")?;
-    Ok(format!("{:014x}", id_num))
+    //
+    Ok(format!("{:012x}", id_num.shr(8)))
 }
 
 fn build_mqtt_options(endpoint: &str, client_id: &str, cfg_dir: &Path) -> Result<MqttOptions> {
@@ -179,20 +181,23 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     let topic = format!("dontek{}/status/psw", hexid);
 
     // Use hexid as client-id to keep it simple
-    let mqttoptions = build_mqtt_options(&cli.endpoint, &format!("reclaim-{}", hexid), &cfg)?;
+    let mqttoptions = build_mqtt_options(&cli.endpoint, &format!("reclaim-client-{}", hexid), &cfg)?;
 
+    println!("Connecting to {}", cli.endpoint);
     let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
-
-    client.subscribe(topic.clone(), QoS::AtMostOnce).await?;
-    println!("Subscribed to {} on {}", topic, cli.endpoint);
 
     loop {
         match eventloop.poll().await {
+            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+                println!("Connected to {}", cli.endpoint);
+                client.subscribe(topic.clone(), QoS::AtLeastOnce).await?;
+                println!("Subscribed to {} on {}", topic, cli.endpoint);
+            }
             Ok(Event::Incoming(Packet::Publish(p))) => {
                 let payload = String::from_utf8_lossy(&p.payload);
                 println!("{}", payload);
             }
-            Ok(_) => {}
+            Ok(v) => {println!("{:?}", v);}
             Err(e) => {
                 return Err(anyhow!("MQTT error: {}", e));
             }
