@@ -10,7 +10,10 @@ aws-config = "1"
 aws-credential-types = "1"
 aws-sdk-cognitoidentity = "1"
 aws-sdk-iot = "1"
-rumqttc = { version = "0.24", default-features = false, features = ["use-rustls", "url"] }
+mqtt-endpoint-tokio = "0.3"
 dirs = "5"
 ureq = { version = "2", default-features = true }
 anyhow = "1"
+rustls-pemfile = "1"
+rustls = "0.21"
+tokio-rustls = "0.24"

@@ -3,12 +3,11 @@ mod reclaim;
 use anyhow::{anyhow, Context, Result};
 use clap::{Parser, Subcommand};
 use dirs::config_dir;
-use rumqttc::{AsyncClient, Event, MqttOptions, Packet, QoS, Transport, TlsConfiguration};
+use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use std::fs;
 use std::io::Write;
 use std::ops::Shr;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 use aws_config::BehaviorVersion;
 
 #[derive(Parser, Debug)]
@@ -151,56 +150,133 @@ fn hex_id_from_decimal(decimal: &str) -> Result<String> {
     Ok(format!("{:012x}", id_num.shr(8)))
 }
 
-fn build_mqtt_options(endpoint: &str, client_id: &str, cfg_dir: &Path) -> Result<MqttOptions> {
-    let mut options = MqttOptions::new(client_id, endpoint, 8883);
-    options.set_keep_alive(Duration::from_secs(30));
+use rustls;
+use rustls_pemfile::{Item, read_one};
+use std::sync::Arc;
 
+fn build_tls_config(cfg_dir: &Path) -> Result<Arc<rustls::ClientConfig>> {
     let ca_path = cfg_dir.join("AmazonRootCA1.pem");
     let cert_path = cfg_dir.join("certificate.pem");
     let key_path = cfg_dir.join("private.pem");
 
-    let ca = fs::read(&ca_path).with_context(|| format!("reading CA pem at {}", ca_path.display()))?;
-    let cert = fs::read(&cert_path).with_context(|| format!("reading certificate.pem at {}", cert_path.display()))?;
-    let key = fs::read(&key_path).with_context(|| format!("reading private.pem at {}", key_path.display()))?;
+    let ca_pem = fs::read(&ca_path).with_context(|| format!("reading CA pem at {}", ca_path.display()))?;
+    let cert_pem = fs::read(&cert_path).with_context(|| format!("reading certificate.pem at {}", cert_path.display()))?;
+    let key_pem = fs::read(&key_path).with_context(|| format!("reading private.pem at {}", key_path.display()))?;
 
-    let tls_config = TlsConfiguration::Simple {
-        ca,
-        alpn: None,
-        client_auth: Some((cert, key)),
-    };
-    options.set_transport(Transport::Tls(tls_config));
+    // Root store from Amazon CA
+    let mut root_store = rustls::RootCertStore::empty();
+    let mut ca_reader = std::io::BufReader::new(&ca_pem[..]);
+    let ca_der_list = rustls_pemfile::certs(&mut ca_reader)
+        .map_err(|e| anyhow!("parsing CA pem: {e}"))?;
+    root_store.add_parsable_certificates(&ca_der_list);
 
-    Ok(options)
+    // Client cert chain
+    let mut certs_reader = std::io::BufReader::new(&cert_pem[..]);
+    let cert_der_list = rustls_pemfile::certs(&mut certs_reader)
+        .map_err(|e| anyhow!("parsing certificate.pem: {e}"))?;
+    if cert_der_list.is_empty() {
+        return Err(anyhow!("No X509 certificate found in certificate.pem"));
+    }
+    let certs: Vec<rustls::Certificate> = cert_der_list.into_iter().map(rustls::Certificate).collect();
+
+    // Private key (supports PKCS#8, PKCS#1, SEC1)
+    let mut key_reader = std::io::BufReader::new(&key_pem[..]);
+    let mut private_key: Option<rustls::PrivateKey> = None;
+    loop {
+        match read_one(&mut key_reader)? {
+            None => break,
+            Some(Item::RSAKey(der)) => { private_key = Some(rustls::PrivateKey(der)); break; }
+            Some(Item::PKCS8Key(der)) => { private_key = Some(rustls::PrivateKey(der)); break; }
+            Some(Item::ECKey(der)) => { private_key = Some(rustls::PrivateKey(der)); break; }
+            _ => {}
+        }
+    }
+    let key = private_key.ok_or_else(|| anyhow!("No private key found in private.pem"))?;
+
+    let config = rustls::ClientConfig::builder()
+        .with_safe_defaults()
+        .with_root_certificates(root_store)
+        .with_client_auth_cert(certs, key)
+        .map_err(|e| anyhow!("building rustls ClientConfig: {e}"))?;
+
+    Ok(Arc::new(config))
 }
 
 async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
+    use mqtt::packet;
+    use mqtt::packet::v3_1_1 as v3;
+    use mqtt::{Endpoint, Mode, Version};
+    use mqtt::transport::{TlsTransport, connect_helper};
+
     let cfg = config_home(cli)?;
     let _ = ensure_ca_pem(&cfg)?;
 
     let hexid = hex_id_from_decimal(unique_id)?;
     let topic = format!("dontek{}/status/psw", hexid);
+    let client_id = format!("reclaim-client-{}", hexid);
 
-    // Use hexid as client-id to keep it simple
-    let mqttoptions = build_mqtt_options(&cli.endpoint, &format!("reclaim-client-{}", hexid), &cfg)?;
+    // Build TLS config from pem files
+    let tls_config = build_tls_config(&cfg)?;
+
+    // Create endpoint and attach TLS transport
+    let endpoint: Endpoint<mqtt::role::Client> = mqtt::Endpoint::new(Version::V3_1_1);
+    let addr = format!("{}:{}", cli.endpoint, 8883);
 
     println!("Connecting to {}", cli.endpoint);
-    let (client, mut eventloop) = AsyncClient::new(mqttoptions, 10);
+    let tls_stream = connect_helper::connect_tcp_tls(&addr, &cli.endpoint, Some(tls_config), None)
+        .await
+        .map_err(|e| anyhow!("TLS connect error: {e}"))?;
+    let transport = TlsTransport::from_stream(tls_stream);
 
+    endpoint.attach(transport, Mode::Client).await.map_err(|e| anyhow!("attach error: {e}"))?;
+
+    // Send CONNECT
+    let connect = v3::Connect::builder()
+        .client_id(&client_id)
+        .unwrap()
+        .clean_session(true)
+        .keep_alive(30)
+        .build()
+        .unwrap();
+    endpoint.send(connect).await.map_err(|e| anyhow!("send CONNECT failed: {e}"))?;
+
+    // Wait for CONNACK
     loop {
-        match eventloop.poll().await {
-            Ok(Event::Incoming(Packet::ConnAck(_))) => {
+        let pkt = endpoint.recv().await.map_err(|e| anyhow!("recv error before CONNACK: {e}"))?;
+        match pkt {
+            packet::Packet::V3_1_1Connack(_ack) => {
                 println!("Connected to {}", cli.endpoint);
-                client.subscribe(topic.clone(), QoS::AtLeastOnce).await?;
-                println!("Subscribed to {} on {}", topic, cli.endpoint);
+                break;
             }
-            Ok(Event::Incoming(Packet::Publish(p))) => {
-                let payload = String::from_utf8_lossy(&p.payload);
+            _ => {
+                // ignore other packets until connack
+            }
+        }
+    }
+
+    // Send SUBSCRIBE QoS 1
+    let pid = endpoint.acquire_packet_id().await.map_err(|e| anyhow!("acquire pid failed: {e}"))?;
+    let subscribe = v3::Subscribe::builder()
+        .packet_id(pid)
+        .entries({
+            let opts = packet::SubOpts::new().set_qos(packet::Qos::AtLeastOnce);
+            let entry = packet::SubEntry::new(&topic, opts).map_err(|e| anyhow!("bad topic filter: {e}"))?;
+            vec![entry]
+        })
+        .build()
+        .unwrap();
+    endpoint.send(subscribe).await.map_err(|e| anyhow!("send SUBSCRIBE failed: {e}"))?;
+    println!("Subscribed to {} on {}", topic, cli.endpoint);
+
+    // Receive loop: print publish payloads
+    loop {
+        let pkt = endpoint.recv().await.map_err(|e| anyhow!("recv error: {e}"))?;
+        match pkt {
+            packet::Packet::V3_1_1Publish(p) => {
+                let payload = String::from_utf8_lossy(p.payload().as_slice());
                 println!("{}", payload);
             }
-            Ok(v) => {println!("{:?}", v);}
-            Err(e) => {
-                return Err(anyhow!("MQTT error: {}", e));
-            }
+            _ => {}
         }
     }
 }
