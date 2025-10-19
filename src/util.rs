@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Context, Result};
 use dirs::config_dir;
 use std::ops::Shr;
-use std::path::{Path, PathBuf};
+use std::path::{PathBuf};
 
 /// Extract the AWS region from an IoT endpoint hostname
 pub fn region_from_endpoint(endpoint: &str) -> Option<String> {

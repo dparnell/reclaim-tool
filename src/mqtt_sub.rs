@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use anyhow::{anyhow, Result};
 use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use tokio::net::lookup_host;
@@ -56,7 +57,7 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
         .client_id(&client_id)
         .unwrap()
         .clean_session(true)
-        .keep_alive(30)
+        .keep_alive(60)
         .build()
         .unwrap();
     endpoint.send(connect).await.map_err(|e| anyhow!("send CONNECT failed: {e}"))?;
@@ -89,9 +90,28 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     endpoint.send(subscribe).await.map_err(|e| anyhow!("send SUBSCRIBE failed: {e}"))?;
     info!("Subscribed to {} on {}", topic, cli.endpoint);
 
-    // Setup periodic refresh publisher
-    let mut ticker = interval(Duration::from_secs(cli.refresh_interval.max(30)));
+    // JSON payload for refresh requests
     let refresh_payload = "{\"messageId\": \"read\", \"modbusReg\": 1, \"modbusVal\": [1]}";
+
+    // Send an immediate refresh request after establishing connection and subscribing
+    {
+        let pid = endpoint.acquire_packet_id().await.map_err(|e| anyhow!("acquire pid failed: {e}"))?;
+        let publish = v3::Publish::builder()
+            .topic_name(&cmd_topic)
+            .unwrap()
+            .qos(packet::Qos::AtLeastOnce)
+            .packet_id(pid)
+            .payload(refresh_payload)
+            .build()
+            .unwrap();
+        endpoint.send(publish).await.map_err(|e| anyhow!("send PUBLISH failed: {e}"))?;
+        info!("Sent initial refresh request to {}", cmd_topic);
+    }
+
+    // Setup periodic refresh publisher (first tick after the interval)
+    let mut ticker = interval(Duration::from_secs(cli.refresh_interval));
+    // Consume the immediate first tick so subsequent ticks occur after the full interval
+    ticker.tick().await;
 
     // Combined loop: receive publishes and send periodic command
     loop {
@@ -101,7 +121,9 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
                 match pkt {
                     packet::Packet::V3_1_1Publish(p) => {
                         let payload = String::from_utf8_lossy(p.payload().as_slice());
-                        info!("{}", payload);
+
+                        let state = crate::reclaim::ReclaimState::from_str(&payload).unwrap();
+                        info!("{:#?}", state);
                     }
                     // Ignore other packets (including PUBACK for our QoS1 publishes)
                     _ => {}
