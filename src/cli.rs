@@ -46,6 +46,10 @@ pub struct Cli {
     #[arg(long, global = true, value_enum, default_value_t = LogLevel::Info)]
     pub log_level: LogLevel,
 
+    /// Refresh interval in seconds for periodic read command
+    #[arg(long, global = true, default_value_t = 60)]
+    pub refresh_interval: u64,
+
     #[command(subcommand)]
     pub command: Commands,
 }

@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use tokio::net::lookup_host;
+use tokio::time::{interval, Duration};
 use tracing::{info, warn};
 
 use crate::cli::Cli;
@@ -28,6 +29,7 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
 
     let hexid = hex_id_from_decimal(unique_id)?;
     let topic = format!("dontek{}/status/psw", hexid);
+    let cmd_topic = format!("dontek{}/cmd/psw", hexid);
     let client_id = format!("reclaim-client-{}", hexid);
 
     // Lookup IP address
@@ -87,15 +89,38 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     endpoint.send(subscribe).await.map_err(|e| anyhow!("send SUBSCRIBE failed: {e}"))?;
     info!("Subscribed to {} on {}", topic, cli.endpoint);
 
-    // Receive loop: print publish payloads
+    // Setup periodic refresh publisher
+    let mut ticker = interval(Duration::from_secs(cli.refresh_interval.max(30)));
+    let refresh_payload = "{\"messageId\": \"read\", \"modbusReg\": 1, \"modbusVal\": [1]}";
+
+    // Combined loop: receive publishes and send periodic command
     loop {
-        let pkt = endpoint.recv().await.map_err(|e| anyhow!("recv error: {e}"))?;
-        match pkt {
-            packet::Packet::V3_1_1Publish(p) => {
-                let payload = String::from_utf8_lossy(p.payload().as_slice());
-                info!("{}", payload);
+        tokio::select! {
+            pkt = endpoint.recv() => {
+                let pkt = pkt.map_err(|e| anyhow!("recv error: {e}"))?;
+                match pkt {
+                    packet::Packet::V3_1_1Publish(p) => {
+                        let payload = String::from_utf8_lossy(p.payload().as_slice());
+                        info!("{}", payload);
+                    }
+                    // Ignore other packets (including PUBACK for our QoS1 publishes)
+                    _ => {}
+                }
             }
-            _ => {}
+            _ = ticker.tick() => {
+                // Send periodic read command to cmd topic
+                let pid = endpoint.acquire_packet_id().await.map_err(|e| anyhow!("acquire pid failed: {e}"))?;
+                let publish = v3::Publish::builder()
+                    .topic_name(&cmd_topic)
+                    .unwrap()
+                    .qos(packet::Qos::AtLeastOnce)
+                    .packet_id(pid)
+                    .payload(refresh_payload)
+                    .build()
+                    .unwrap();
+                endpoint.send(publish).await.map_err(|e| anyhow!("send PUBLISH failed: {e}"))?;
+                info!("Sent refresh request to {}", cmd_topic);
+            }
         }
     }
 }
