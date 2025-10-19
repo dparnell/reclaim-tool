@@ -120,10 +120,12 @@ async fn fetch_and_save_certs(cli: &Cli) -> Result<()> {
 
     let out = iot_client
         .create_keys_and_certificate()
-        .set_set_as_active(Some(true))
+        .set_as_active(true)
         .send()
         .await
         .context("IoT CreateKeysAndCertificate failed (ensure IAM policy allows it)")?;
+
+    iot_client.attach_policy().policy_name("pswpolicy").target(out.certificate_arn().unwrap_or_default()).send().await.context("IoT AttachPolicy failed")?;
 
     let cert_pem = out.certificate_pem().unwrap_or_default();
     let key_pair = out.key_pair().ok_or_else(|| anyhow!("No key pair returned"))?;
