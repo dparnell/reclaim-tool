@@ -1,7 +1,7 @@
 mod reclaim;
 
 use anyhow::{anyhow, Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use dirs::config_dir;
 use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use std::fs;
@@ -10,6 +10,7 @@ use std::ops::Shr;
 use std::path::{Path, PathBuf};
 use aws_config::BehaviorVersion;
 use tokio::net::lookup_host;
+use tracing::{info, warn};
 
 fn region_from_endpoint(endpoint: &str) -> Option<String> {
     // Expected formats:
@@ -23,6 +24,15 @@ fn region_from_endpoint(endpoint: &str) -> Option<String> {
         }
     }
     None
+}
+
+#[derive(ValueEnum, Clone, Debug)]
+enum LogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+    Trace,
 }
 
 #[derive(Parser, Debug)]
@@ -43,6 +53,10 @@ struct Cli {
     /// Configuration directory (defaults to ~/.config/reclaim)
     #[arg(long, global = true)]
     config_dir: Option<PathBuf>,
+
+    /// Log level (error, warn, info, debug, trace)
+    #[arg(long, global = true, value_enum, default_value_t = LogLevel::Info)]
+    log_level: LogLevel,
 
     #[command(subcommand)]
     command: Commands,
@@ -98,10 +112,7 @@ async fn fetch_and_save_certs(cli: &Cli) -> Result<()> {
     let chosen_region = ep_region.as_deref().unwrap_or(&cli.region);
     if let Some(ep) = &ep_region {
         if ep != &cli.region {
-            eprintln!(
-                "Warning: endpoint region '{}' differs from configured region '{}'; using endpoint region",
-                ep, cli.region
-            );
+            warn!("endpoint region '{}' differs from configured region '{}'; using endpoint region", ep, cli.region);
         }
     }
     let region = Region::new(chosen_region.to_string());
@@ -166,7 +177,7 @@ async fn fetch_and_save_certs(cli: &Cli) -> Result<()> {
     // Ensure CA present for MQTT
     let _ = ensure_ca_pem(&cfg)?;
 
-    println!("Saved certificate.pem and private.pem to {}", cfg.display());
+    info!("Saved certificate.pem and private.pem to {}", cfg.display());
     Ok(())
 }
 
@@ -243,8 +254,8 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     // Informative warning if region and endpoint do not match
     if let Some(ep_region) = region_from_endpoint(&cli.endpoint) {
         if ep_region != cli.region {
-            eprintln!(
-                "Warning: endpoint region '{}' differs from configured region '{}'. Ensure certificates are created in the endpoint's region.",
+            warn!(
+                "endpoint region '{}' differs from configured region '{}'. Ensure certificates are created in the endpoint's region.",
                 ep_region, cli.region
             );
         }
@@ -256,9 +267,9 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
 
     // Lookup IP address
     let addr = format!("{}:{}", cli.endpoint, 8883);
-    println!("Connecting to {}...", addr);
+    info!("Connecting to {}...", addr);
     let resolved = lookup_host(&addr).await?.next().ok_or_else(|| anyhow!("DNS lookup failed for {}", cli.endpoint))?;
-    println!("Resolved to {}", resolved);
+    info!("Resolved to {}", resolved);
 
     // Build TLS config from pem files
     let tls_config = build_tls_config(&cfg)?;
@@ -288,7 +299,7 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
         let pkt = endpoint.recv().await.map_err(|e| anyhow!("recv error before CONNACK: {e}"))?;
         match pkt {
             packet::Packet::V3_1_1Connack(_ack) => {
-                println!("Connected to {}", cli.endpoint);
+                info!("Connected to {}", cli.endpoint);
                 break;
             }
             _ => {
@@ -309,7 +320,7 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
         .build()
         .unwrap();
     endpoint.send(subscribe).await.map_err(|e| anyhow!("send SUBSCRIBE failed: {e}"))?;
-    println!("Subscribed to {} on {}", topic, cli.endpoint);
+    info!("Subscribed to {} on {}", topic, cli.endpoint);
 
     // Receive loop: print publish payloads
     loop {
@@ -317,16 +328,35 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
         match pkt {
             packet::Packet::V3_1_1Publish(p) => {
                 let payload = String::from_utf8_lossy(p.payload().as_slice());
-                println!("{}", payload);
+                info!("{}", payload);
             }
             _ => {}
         }
     }
 }
 
+fn init_logging(level: &LogLevel) {
+    let level_str = match level {
+        LogLevel::Error => "error",
+        LogLevel::Warn => "warn",
+        LogLevel::Info => "info",
+        LogLevel::Debug => "debug",
+        LogLevel::Trace => "trace",
+    };
+    let filter = tracing_subscriber::EnvFilter::new(level_str);
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_ansi(true)
+        .with_target(false)
+        .with_level(true)
+        .compact()
+        .init();
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
+    init_logging(&cli.log_level);
     match &cli.command {
         Commands::FetchCerts => fetch_and_save_certs(&cli).await,
         Commands::Subscribe { unique_id } => subscribe(&cli, unique_id).await, 
