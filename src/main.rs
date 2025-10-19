@@ -11,6 +11,20 @@ use std::path::{Path, PathBuf};
 use aws_config::BehaviorVersion;
 use tokio::net::lookup_host;
 
+fn region_from_endpoint(endpoint: &str) -> Option<String> {
+    // Expected formats:
+    //  - <id>-ats.iot.<region>.amazonaws.com
+    //  - <id>.iot.<region>.amazonaws.com
+    let parts: Vec<&str> = endpoint.split('.').collect();
+    // Find the "iot" label and take the next part as region
+    if let Some(iot_idx) = parts.iter().position(|p| *p == "iot") {
+        if let Some(region_part) = parts.get(iot_idx + 1) {
+            return Some((*region_part).to_string());
+        }
+    }
+    None
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "reclaim", version, about = "AWS IoT client for Reclaim Energy heat pump controller")] 
 struct Cli {
@@ -79,7 +93,18 @@ async fn fetch_and_save_certs(cli: &Cli) -> Result<()> {
     use aws_sdk_cognitoidentity as cognito;
     use aws_sdk_iot as iot;
 
-    let region = Region::new(cli.region.clone());
+    // Derive region from endpoint to avoid creating certs in the wrong region
+    let ep_region = region_from_endpoint(&cli.endpoint);
+    let chosen_region = ep_region.as_deref().unwrap_or(&cli.region);
+    if let Some(ep) = &ep_region {
+        if ep != &cli.region {
+            eprintln!(
+                "Warning: endpoint region '{}' differs from configured region '{}'; using endpoint region",
+                ep, cli.region
+            );
+        }
+    }
+    let region = Region::new(chosen_region.to_string());
 
     // 1) Acquire unauthenticated Cognito Identity and temporary credentials
     let cognito_config = aws_config::defaults(BehaviorVersion::latest()).region(region.clone()).load().await;
@@ -106,10 +131,11 @@ async fn fetch_and_save_certs(cli: &Cli) -> Result<()> {
         .credentials()
         .ok_or_else(|| anyhow!("No credentials returned by Cognito Identity"))?;
 
+    let session_token_opt = creds.session_token().map(|s| s.to_string());
     let creds = Credentials::new(
         creds.access_key_id().unwrap_or_default(),
         creds.secret_key().unwrap_or_default(),
-        Some(creds.session_token().unwrap_or_default().to_string()),
+        session_token_opt,
         None,
         "cognito-identity",
     );
@@ -213,6 +239,16 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
 
     let cfg = config_home(cli)?;
     let _ = ensure_ca_pem(&cfg)?;
+
+    // Informative warning if region and endpoint do not match
+    if let Some(ep_region) = region_from_endpoint(&cli.endpoint) {
+        if ep_region != cli.region {
+            eprintln!(
+                "Warning: endpoint region '{}' differs from configured region '{}'. Ensure certificates are created in the endpoint's region.",
+                ep_region, cli.region
+            );
+        }
+    }
 
     let hexid = hex_id_from_decimal(unique_id)?;
     let topic = format!("dontek{}/status/psw", hexid);
