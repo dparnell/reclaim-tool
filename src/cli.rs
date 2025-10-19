@@ -50,6 +50,26 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 60)]
     pub refresh_interval: u64,
 
+    /// Append every received MQTT payload to this file (raw JSON, one line per message)
+    #[arg(long, global = true)]
+    pub out_file: Option<PathBuf>,
+
+    /// InfluxDB v2 base URL (e.g. http://localhost:8086). When set, metrics are written for each received message.
+    #[arg(long, global = true)]
+    pub influx_url: Option<String>,
+    /// InfluxDB organisation name
+    #[arg(long, global = true)]
+    pub influx_org: Option<String>,
+    /// InfluxDB bucket name
+    #[arg(long, global = true)]
+    pub influx_bucket: Option<String>,
+    /// InfluxDB API token
+    #[arg(long, global = true)]
+    pub influx_token: Option<String>,
+    /// InfluxDB measurement name
+    #[arg(long, global = true, default_value = "reclaim")]
+    pub influx_measurement: String,
+
     #[command(subcommand)]
     pub command: Commands,
 }

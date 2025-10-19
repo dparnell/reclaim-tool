@@ -3,11 +3,13 @@ use anyhow::{anyhow, Result};
 use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use tokio::net::lookup_host;
 use tokio::time::{interval, Duration};
-use tracing::{info, warn};
+use tracing::{info, warn, error};
 
 use crate::cli::Cli;
 use crate::tls::build_tls_config;
 use crate::util::{config_home, hex_id_from_decimal, region_from_endpoint};
+use tokio::fs::OpenOptions;
+use tokio::io::AsyncWriteExt;
 
 pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     use mqtt::packet;
@@ -122,8 +124,32 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
                     packet::Packet::V3_1_1Publish(p) => {
                         let payload = String::from_utf8_lossy(p.payload().as_slice());
 
-                        let state = crate::reclaim::ReclaimState::from_str(&payload).unwrap();
-                        info!("{:#?}", state);
+                        match crate::reclaim::ReclaimState::from_str(&payload) {
+                            Ok(state) => {
+                                info!("{:#?}", state);
+                                // Optionally write raw payload to file
+                                if let Some(path) = &cli.out_file {
+                                    if let Err(e) = append_line(path, &payload).await { error!("Failed to write to file {:?}: {}", path, e); }
+                                }
+                                // Optionally write to InfluxDB
+                                if let Some(url) = &cli.influx_url {
+                                    if let (Some(org), Some(bucket)) = (&cli.influx_org, &cli.influx_bucket) {
+                                        if let Err(e) = write_influx(url, org, bucket, cli.influx_token.as_deref(), &cli.influx_measurement, unique_id, &cli.region, &state).await {
+                                            warn!("Influx write failed: {}", e);
+                                        }
+                                    } else {
+                                        warn!("influx_url provided but influx_org/influx_bucket not set; skipping write");
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                warn!("Failed to parse ReclaimState: {}", e);
+                                // Still write raw payload to file if configured
+                                if let Some(path) = &cli.out_file {
+                                    if let Err(e) = append_line(path, &payload).await { error!("Failed to write to file {:?}: {}", path, e); }
+                                }
+                            }
+                        }
                     }
                     // Ignore other packets (including PUBACK for our QoS1 publishes)
                     _ => {}
@@ -145,4 +171,66 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
             }
         }
     }
+}
+
+async fn append_line(path: &std::path::PathBuf, line: &str) -> Result<()> {
+    if let Some(parent) = path.parent() { tokio::fs::create_dir_all(parent).await.ok(); }
+    let mut f = OpenOptions::new().append(true).create(true).open(path).await?;
+    f.write_all(line.as_bytes()).await?;
+    f.write_all(b"\n").await?;
+    Ok(())
+}
+
+fn to_line_protocol(measurement: &str, unique_id: &str, region: &str, state: &crate::reclaim::ReclaimState, timestamp_ns: i128) -> String {
+    // tags
+    let mut line = format!("{measurement},unique_id={unique_id},region={region}");
+    // fields (booleans as integers)
+    let fields = vec![
+        ("pump_active", if state.pump_active { "1i".to_string() } else { "0i".to_string() }),
+        ("case_temperature", format!("{}", state.case_temperature)),
+        ("water_temperature", format!("{}", state.water_temperature)),
+        ("outlet_temperature", format!("{}", state.outlet_temperature)),
+        ("inlet_temperature", format!("{}", state.inlet_temperature)),
+        ("discharge_temperature", format!("{}", state.discharge_temperature)),
+        ("suction", format!("{}", state.suction)),
+        ("evaporator", format!("{}", state.evaporator)),
+        ("ambient_temperature", format!("{}", state.ambient_temperature)),
+        ("compressor_speed", format!("{}", state.compressor_speed)),
+        ("water_speed", format!("{}", state.water_speed)),
+        ("fan_speed", format!("{}", state.fan_speed)),
+        ("power", format!("{}", state.power)),
+        ("current", format!("{}", state.current)),
+    ];
+    line.push(' ');
+    line.push_str(&fields.into_iter().map(|(k,v)| format!("{k}={v}")).collect::<Vec<_>>().join(","));
+    line.push(' ');
+    line.push_str(&timestamp_ns.to_string());
+    line
+}
+
+async fn write_influx(
+    base_url: &str,
+    org: &str,
+    bucket: &str,
+    token: Option<&str>,
+    measurement: &str,
+    unique_id: &str,
+    region: &str,
+    state: &crate::reclaim::ReclaimState,
+) -> Result<()> {
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap();
+    let ts_ns: i128 = (now.as_secs() as i128) * 1_000_000_000 + (now.subsec_nanos() as i128);
+    let line = to_line_protocol(measurement, unique_id, region, state, ts_ns);
+
+    let url = format!("{}/api/v2/write?org={}&bucket={}&precision=ns", base_url.trim_end_matches('/'), urlencoding::encode(org), urlencoding::encode(bucket));
+    let client = reqwest::Client::new();
+    let mut req = client.post(url).header("Content-Type", "text/plain; charset=utf-8").body(line);
+    if let Some(tok) = token { req = req.header("Authorization", format!("Token {}", tok)); }
+    let resp = req.send().await?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+        return Err(anyhow!("InfluxDB write failed: {} {}", status, text));
+    }
+    Ok(())
 }
