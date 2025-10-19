@@ -3,7 +3,7 @@ use anyhow::{anyhow, Result};
 use mqtt_endpoint_tokio::mqtt_ep as mqtt;
 use tokio::net::lookup_host;
 use tokio::time::{interval, Duration};
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use crate::cli::Cli;
 use crate::tls::build_tls_config;
@@ -37,9 +37,9 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
 
     // Lookup IP address
     let addr = format!("{}:{}", cli.endpoint, 8883);
-    info!("Connecting to {}...", addr);
+    debug!("Connecting to {}...", addr);
     let resolved = lookup_host(&addr).await?.next().ok_or_else(|| anyhow!("DNS lookup failed for {}", cli.endpoint))?;
-    info!("Resolved to {}", resolved);
+    debug!("Resolved to {}", resolved);
 
     // Build TLS config from pem files
     let tls_config = build_tls_config(&cfg)?;
@@ -95,25 +95,8 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     // JSON payload for refresh requests
     let refresh_payload = "{\"messageId\": \"read\", \"modbusReg\": 1, \"modbusVal\": [1]}";
 
-    // Send an immediate refresh request after establishing connection and subscribing
-    {
-        let pid = endpoint.acquire_packet_id().await.map_err(|e| anyhow!("acquire pid failed: {e}"))?;
-        let publish = v3::Publish::builder()
-            .topic_name(&cmd_topic)
-            .unwrap()
-            .qos(packet::Qos::AtLeastOnce)
-            .packet_id(pid)
-            .payload(refresh_payload)
-            .build()
-            .unwrap();
-        endpoint.send(publish).await.map_err(|e| anyhow!("send PUBLISH failed: {e}"))?;
-        info!("Sent initial refresh request to {}", cmd_topic);
-    }
-
     // Setup periodic refresh publisher (first tick after the interval)
     let mut ticker = interval(Duration::from_secs(cli.refresh_interval));
-    // Consume the immediate first tick so subsequent ticks occur after the full interval
-    ticker.tick().await;
 
     // Combined loop: receive publishes and send periodic command
     loop {
@@ -126,7 +109,7 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
 
                         match crate::reclaim::ReclaimState::from_str(&payload) {
                             Ok(state) => {
-                                info!("{:#?}", state);
+                                debug!("{:#?}", state);
                                 // Optionally write raw payload to file
                                 if let Some(path) = &cli.out_file {
                                     if let Err(e) = append_line(path, &payload).await { error!("Failed to write to file {:?}: {}", path, e); }
@@ -167,7 +150,7 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
                     .build()
                     .unwrap();
                 endpoint.send(publish).await.map_err(|e| anyhow!("send PUBLISH failed: {e}"))?;
-                info!("Sent refresh request to {}", cmd_topic);
+                debug!("Sent refresh request to {}", cmd_topic);
             }
         }
     }
