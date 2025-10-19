@@ -9,6 +9,7 @@ use std::io::Write;
 use std::ops::Shr;
 use std::path::{Path, PathBuf};
 use aws_config::BehaviorVersion;
+use tokio::net::lookup_host;
 
 #[derive(Parser, Debug)]
 #[command(name = "reclaim", version, about = "AWS IoT client for Reclaim Energy heat pump controller")] 
@@ -215,15 +216,19 @@ async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
     let topic = format!("dontek{}/status/psw", hexid);
     let client_id = format!("reclaim-client-{}", hexid);
 
+    // Lookup IP address
+    let addr = format!("{}:{}", cli.endpoint, 8883);
+    println!("Connecting to {}...", addr);
+    let resolved = lookup_host(&addr).await?.next().ok_or_else(|| anyhow!("DNS lookup failed for {}", cli.endpoint))?;
+    println!("Resolved to {}", resolved);
+
     // Build TLS config from pem files
     let tls_config = build_tls_config(&cfg)?;
 
     // Create endpoint and attach TLS transport
     let endpoint: Endpoint<mqtt::role::Client> = mqtt::Endpoint::new(Version::V3_1_1);
-    let addr = format!("{}:{}", cli.endpoint, 8883);
 
-    println!("Connecting to {}", cli.endpoint);
-    let tls_stream = connect_helper::connect_tcp_tls(&addr, &cli.endpoint, Some(tls_config), None)
+    let tls_stream = connect_helper::connect_tcp_tls(&resolved.to_string(), &cli.endpoint, Some(tls_config), None)
         .await
         .map_err(|e| anyhow!("TLS connect error: {e}"))?;
     let transport = TlsTransport::from_stream(tls_stream);
