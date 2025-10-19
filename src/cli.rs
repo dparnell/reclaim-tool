@@ -10,6 +10,12 @@ pub enum LogLevel {
     Trace,
 }
 
+#[derive(ValueEnum, Clone, Debug)]
+pub enum InfluxApiVersion {
+    V1,
+    V2,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     /// Fetch a new private key and certificate and save them to the config directory
@@ -54,16 +60,27 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub out_file: Option<PathBuf>,
 
-    /// InfluxDB v2 base URL (e.g. http://localhost:8086). When set, metrics are written for each received message.
+    /// InfluxDB base URL (e.g. http://localhost:8086). When set, metrics are written for each received message.
     #[arg(long, global = true)]
     pub influx_url: Option<String>,
-    /// InfluxDB organisation name
+
+    /// InfluxDB API version (v1 or v2). Defaults to v1.
+    #[arg(long, global = true, value_enum, default_value_t = InfluxApiVersion::V1)]
+    pub influx_api_version: InfluxApiVersion,
+
+    /// InfluxDB organisation name (required for v2)
     #[arg(long, global = true)]
     pub influx_org: Option<String>,
-    /// InfluxDB bucket name
+    /// InfluxDB bucket (v2) or database name (v1)
     #[arg(long, global = true)]
     pub influx_bucket: Option<String>,
-    /// InfluxDB API token
+    /// InfluxDB v1 username (optional; used only for v1)
+    #[arg(long, global = true)]
+    pub influx_username: Option<String>,
+    /// InfluxDB v1 password (optional; used only for v1)
+    #[arg(long, global = true)]
+    pub influx_password: Option<String>,
+    /// InfluxDB API token (used only for v2)
     #[arg(long, global = true)]
     pub influx_token: Option<String>,
     /// InfluxDB measurement name

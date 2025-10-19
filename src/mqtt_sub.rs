@@ -116,12 +116,24 @@ pub async fn subscribe(cli: &Cli, unique_id: &str) -> Result<()> {
                                 }
                                 // Optionally write to InfluxDB
                                 if let Some(url) = &cli.influx_url {
-                                    if let (Some(org), Some(bucket)) = (&cli.influx_org, &cli.influx_bucket) {
-                                        if let Err(e) = write_influx(url, org, bucket, cli.influx_token.as_deref(), &cli.influx_measurement, unique_id, &cli.region, &state).await {
+                                    if let Some(bucket) = &cli.influx_bucket {
+                                        if let Err(e) = write_influx(
+                                            url,
+                                            &cli.influx_api_version,
+                                            cli.influx_org.as_deref(),
+                                            bucket,
+                                            cli.influx_token.as_deref(),
+                                            cli.influx_username.as_deref(),
+                                            cli.influx_password.as_deref(),
+                                            &cli.influx_measurement,
+                                            unique_id,
+                                            &cli.region,
+                                            &state,
+                                        ).await {
                                             warn!("Influx write failed: {}", e);
                                         }
                                     } else {
-                                        warn!("influx_url provided but influx_org/influx_bucket not set; skipping write");
+                                        warn!("influx_url provided but influx_bucket not set; skipping write");
                                     }
                                 }
                             }
@@ -193,9 +205,12 @@ fn to_line_protocol(measurement: &str, unique_id: &str, region: &str, state: &cr
 
 async fn write_influx(
     base_url: &str,
-    org: &str,
+    api_version: &crate::cli::InfluxApiVersion,
+    org: Option<&str>,
     bucket: &str,
     token: Option<&str>,
+    username: Option<&str>,
+    password: Option<&str>,
     measurement: &str,
     unique_id: &str,
     region: &str,
@@ -205,15 +220,32 @@ async fn write_influx(
     let ts_ns: i128 = (now.as_secs() as i128) * 1_000_000_000 + (now.subsec_nanos() as i128);
     let line = to_line_protocol(measurement, unique_id, region, state, ts_ns);
 
-    let url = format!("{}/api/v2/write?org={}&bucket={}&precision=ns", base_url.trim_end_matches('/'), urlencoding::encode(org), urlencoding::encode(bucket));
+    let base = base_url.trim_end_matches('/');
     let client = reqwest::Client::new();
-    let mut req = client.post(url).header("Content-Type", "text/plain; charset=utf-8").body(line);
-    if let Some(tok) = token { req = req.header("Authorization", format!("Token {}", tok)); }
+    let req = match api_version {
+        crate::cli::InfluxApiVersion::V1 => {
+            // InfluxDB v1 write endpoint: /write?db=<db>&precision=ns[&u=...&p=...]
+            let mut url = format!("{}/write?db={}&precision=ns", base, urlencoding::encode(bucket));
+            if let Some(u) = username {
+                let p_enc = urlencoding::encode(password.unwrap_or(""));
+                url.push_str(&format!("&u={}&p={}", urlencoding::encode(u), p_enc));
+            }
+            client.post(url.clone()).header("Content-Type", "text/plain; charset=utf-8").body(line)
+        }
+        crate::cli::InfluxApiVersion::V2 => {
+            let org = org.ok_or_else(|| anyhow!("influx_org is required for InfluxDB v2"))?;
+            let url = format!("{}/api/v2/write?org={}&bucket={}&precision=ns", base, urlencoding::encode(org), urlencoding::encode(bucket));
+            let mut req = client.post(url.clone()).header("Content-Type", "text/plain; charset=utf-8").body(line);
+            if let Some(tok) = token { req = req.header("Authorization", format!("Token {}", tok)); }
+            req
+        }
+    };
+
     let resp = req.send().await?;
     if !resp.status().is_success() {
         let status = resp.status();
         let text = resp.text().await.unwrap_or_default();
-        return Err(anyhow!("InfluxDB write failed: {} {}", status, text));
+        return Err(anyhow!("InfluxDB write failed ({}): {} {}", match api_version { crate::cli::InfluxApiVersion::V1 => "v1", crate::cli::InfluxApiVersion::V2 => "v2" }, status, text));
     }
     Ok(())
 }
