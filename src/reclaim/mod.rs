@@ -1,3 +1,4 @@
+use std::ops::BitAnd;
 use std::str::FromStr;
 use json::JsonValue;
 
@@ -56,25 +57,30 @@ impl FromStr for ReclaimState {
             _ => vec![]
         };
 
-        for v in values.chunks(2) {
-            match v[0] {
-                50 => state.case_temperature = v[1] as f32 / 2.0,
-                79 => state.water_temperature = v[1] as f32 / 2.0,
-                200 => state.pump_active = v[1] != 0,
-                213 => state.outlet_temperature = v[1] as f32,
-                214 => state.inlet_temperature = v[1] as f32,
-                215 => state.discharge_temperature = v[1] as f32,
-                216 => state.suction = v[1] as f32,
-                217 => state.evaporator = v[1] as f32,
-                218 => state.ambient_temperature = v[1] as f32,
-                219 => state.compressor_speed = v[1] as f32,
-                220 => state.water_speed = v[1] as f32,
-                221 => state.fan_speed = v[1] as f32,
-                225 => state.power = v[1] as f32,
-                226 => state.current = v[1] as f32,
-                _ => {}
+        if values.len().bitand(1) == 0 {
+            for v in values.chunks(2) {
+                match v[0] {
+                    50 => state.case_temperature = v[1] as f32 / 2.0,
+                    79 => state.water_temperature = v[1] as f32 / 2.0,
+                    200 => state.pump_active = v[1] != 0,
+                    213 => state.outlet_temperature = v[1] as f32,
+                    214 => state.inlet_temperature = v[1] as f32,
+                    215 => state.discharge_temperature = v[1] as f32,
+                    216 => state.suction = v[1] as f32,
+                    217 => state.evaporator = v[1] as f32,
+                    218 => state.ambient_temperature = v[1] as f32,
+                    219 => state.compressor_speed = v[1] as f32,
+                    220 => state.water_speed = v[1] as f32,
+                    221 => state.fan_speed = v[1] as f32,
+                    225 => state.power = v[1] as f32,
+                    226 => state.current = v[1] as f32,
+                    _ => {}
+                }
             }
+        } else {
+            dbg!("invalid json: modbusVal is not an array of pairs: {:?}", s);
         }
+
 
         Ok(state)
     }
